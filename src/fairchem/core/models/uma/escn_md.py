@@ -810,6 +810,21 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         }
         return out
 
+    def compile_regional_blocks(self, dynamic: bool = True) -> None:
+        """
+        Regionally compile the repeated interaction blocks in place.
+
+        Each block is compiled individually so the single block graph is
+        compiled once and reused across all layers. This cuts cold-compile time
+        dramatically versus compiling the whole model while preserving inference
+        speed and recompile-free behavior across system sizes.
+
+        Args:
+            dynamic: Whether to compile the block with dynamic shapes.
+        """
+        for i in range(len(self.blocks)):
+            self.blocks[i] = torch.compile(self.blocks[i], dynamic=dynamic)
+
     @property
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

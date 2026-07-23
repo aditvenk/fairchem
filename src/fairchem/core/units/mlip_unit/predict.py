@@ -470,9 +470,24 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 "Model is being compiled this might take a while for the first time"
             )
             torch._dynamo.config.recompile_limit = 32
-            self.model = torch.compile(self.model, dynamic=True)
+            self._compile_model()
 
         self.lazy_model_intialized = True
+
+    def _compile_model(self) -> None:
+        """
+        Compile the model for inference.
+
+        Backbones that support regional compilation compile their repeated
+        blocks individually: one block graph is compiled once and reused across
+        all layers, which cuts cold-compile time dramatically while preserving.
+        Backbones without such support fall back to whole-model compilation.
+        """
+        backbone = self.model.module.backbone
+        if hasattr(backbone, "compile_regional_blocks"):
+            backbone.compile_regional_blocks(dynamic=True)
+        else:
+            self.model = torch.compile(self.model, dynamic=True)
 
     def _run_inference(self, data: AtomicData, undo_refs: bool) -> dict:
         """
