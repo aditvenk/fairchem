@@ -80,8 +80,10 @@ class GPContext:
         send_splits: Per-rank split sizes for the embedding send buffer.
         recv_splits: Per-rank split sizes for the embedding recv buffer.
         total_recv: Total number of embeddings to receive (sum of recv_splits).
-        local_edge_idx: Indices into edge_index_local where source is a local atom.
-        remote_edge_idx: Indices into edge_index_local where source is a remote atom.
+        local_edge_idx: Indices where source is a local atom, pre-permutation.
+        remote_edge_idx: Indices where source is a remote atom, pre-permutation.
+        edge_perm: Permutation ordering local-source edges first.
+        num_local_edges: Count of local-source edges, the split point.
         symm_plan: Cached SymmHaloPlan, set on first symmetric-memory exchange.
         rank_assignments: Rank owner for each atom, shape (total_atoms,).
     """
@@ -99,8 +101,13 @@ class GPContext:
     local_edge_idx: torch.Tensor
     remote_edge_idx: torch.Tensor
     rank_assignments: torch.Tensor
-    # Populated lazily by symm_all_to_all_collect; depends only on the
-    # partition, so it is reused by every layer sharing this context.
+    # Reordering that puts local-source edges first. edge_index_local is
+    # already permuted; the caller must apply it to the per-edge graph tensors
+    # so wigner and the radial embedding stay aligned.
+    edge_perm: torch.Tensor | None = None
+    num_local_edges: int = 0
+    # Populated by prepare_symm_plan; depends only on the partition, so it is
+    # reused by every layer sharing this context.
     symm_plan: object | None = None
 
 
@@ -344,6 +351,17 @@ def build_gp_context(
     local_edge_idx = local_edge_mask.nonzero(as_tuple=True)[0]
     remote_edge_idx = (~local_edge_mask).nonzero(as_tuple=True)[0]
 
+    # Order local-source edges first so an overlapping Edgewise can split with
+    # a contiguous slice. Gathering five per-edge tensors by index instead
+    # would cost more memory traffic than the overlap recovers.
+    gp_config = gp_utils.get_gp_config()
+    edge_perm = None
+    num_local_edges = 0
+    if gp_config is not None and gp_config.overlap:
+        edge_perm = torch.cat([local_edge_idx, remote_edge_idx])
+        num_local_edges = int(local_edge_idx.numel())
+        edge_index_local = edge_index_local[:, edge_perm]
+
     return GPContext(
         rank=rank,
         world_size=world_size,
@@ -358,6 +376,8 @@ def build_gp_context(
         local_edge_idx=local_edge_idx,
         remote_edge_idx=remote_edge_idx,
         rank_assignments=rank_assignments,
+        edge_perm=edge_perm,
+        num_local_edges=num_local_edges,
     )
 
 

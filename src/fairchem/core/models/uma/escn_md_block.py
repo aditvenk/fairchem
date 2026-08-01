@@ -142,6 +142,15 @@ class Edgewise(torch.nn.Module):
         if gp_utils.initialized():
             gp_config = gp_utils.get_gp_config()
             if gp_config.mode == "all_to_all":
+                if self._can_overlap(gp_config, gp_ctx, edge_index):
+                    return self._forward_overlap(
+                        x,
+                        x_edge,
+                        wigner,
+                        wigner_inv_envelope,
+                        scatter_target,
+                        gp_ctx,
+                    )
                 collect = (
                     symm_all_to_all_collect
                     if gp_config.transport == "symm_mem"
@@ -207,6 +216,70 @@ class Edgewise(torch.nn.Module):
             if len(new_embeddings) > 8:
                 new_embeddings = [torch.stack(new_embeddings).sum(axis=0)]
         return torch.stack(new_embeddings).sum(axis=0)
+
+    @staticmethod
+    def _can_overlap(gp_config, gp_ctx, edge_index) -> bool:
+        """
+        Overlap needs both edge groups non-empty and the symmetric transport.
+
+        A rank can legitimately hold a single fake self-loop edge, which would
+        leave one group empty and push zero-size tensors through the SO2 GEMMs.
+        """
+        if not gp_config.overlap or gp_config.transport != "symm_mem":
+            return False
+        if gp_ctx is None or gp_ctx.edge_perm is None:
+            return False
+        n_local = gp_ctx.num_local_edges
+        return 0 < n_local < gp_ctx.edge_index_local.shape[1]
+
+    def _forward_overlap(
+        self, x, x_edge, wigner, wigner_inv_envelope, scatter_target, gp_ctx
+    ):
+        """
+        Compute local-source edges while the halo is still in flight.
+
+        Edges are ordered local-source first by build_gp_context, so both
+        groups are contiguous slices. index_add_ makes the two partial node
+        results safe to sum.
+        """
+        from fairchem.core.common.parallelism.symm_halo import (
+            symm_halo_start,
+            symm_halo_wait,
+        )
+
+        plan_id = gp_ctx.symm_plan.plan_id
+        n = gp_ctx.num_local_edges
+        eil = gp_ctx.edge_index_local
+
+        with record_function("a2a_start"):
+            token = symm_halo_start(x, gp_ctx.send_indices, plan_id)
+
+        with record_function("edgewise_local"):
+            out = self.forward_chunk(
+                x,
+                x.shape[0],
+                x_edge[:n],
+                eil[:, :n],
+                wigner[:n],
+                wigner_inv_envelope[:n],
+                scatter_target[:n],
+            )
+
+        with record_function("a2a_wait"):
+            x_received = symm_halo_wait(token, x, gp_ctx.send_indices, plan_id)
+            x_full = torch.cat([x, x_received], dim=0)
+
+        with record_function("edgewise_remote"):
+            out = out + self.forward_chunk(
+                x_full,
+                x.shape[0],
+                x_edge[n:],
+                eil[:, n:],
+                wigner[n:],
+                wigner_inv_envelope[n:],
+                scatter_target[n:],
+            )
+        return out
 
     def forward_chunk(
         self,

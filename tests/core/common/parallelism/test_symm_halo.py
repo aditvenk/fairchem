@@ -146,3 +146,51 @@ def _exchange_worker(rank, world, port):
 @pytest.mark.skipif(torch.cuda.device_count() < 3, reason="needs 3 GPUs")
 def test_symm_exchange_matches_nccl():
     mp.spawn(_exchange_worker, args=(3, 29732), nprocs=3, join=True)
+
+
+def test_edge_perm_orders_local_sources_first():
+    """
+    The overlap split is a contiguous slice, so build_gp_context must place
+    every local-source edge before every remote-source one and permute
+    edge_index_local to match.
+    """
+    from fairchem.core.common.gp_utils import (
+        GPMode,
+        GPPartition,
+        GPTransport,
+        GraphParallelConfig,
+        set_gp_config,
+    )
+    from fairchem.core.common.parallelism.graph_parallel_a2a import build_gp_context
+
+    prev = gp_utils.get_gp_config()
+    set_gp_config(
+        GraphParallelConfig(
+            group_size=2,
+            mode=GPMode.ALL_TO_ALL,
+            partition=GPPartition.SPATIAL,
+            transport=GPTransport.SYMM_MEM,
+            overlap=True,
+        )
+    )
+    try:
+        # Atoms 0-3 owned by rank 0, 4-7 by rank 1; mix local and remote sources.
+        rank_assignments = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        edge_index = torch.tensor([[4, 0, 5, 1, 6], [0, 1, 2, 3, 0]])
+        ctx = build_gp_context(
+            edge_index=edge_index,
+            rank_assignments=rank_assignments,
+            rank=0,
+            world_size=2,
+            node_partition=torch.tensor([0, 1, 2, 3]),
+        )
+
+        assert ctx.edge_perm is not None
+        n = ctx.num_local_edges
+        srcs = ctx.edge_index_local[0]
+        assert (srcs[:n] < ctx.total_local_atoms).all(), "local block has a remote src"
+        assert (srcs[n:] >= ctx.total_local_atoms).all(), "remote block has a local src"
+        # The permutation must be a bijection over the edges, losing none.
+        assert sorted(ctx.edge_perm.tolist()) == list(range(edge_index.shape[1]))
+    finally:
+        set_gp_config(prev) if prev is not None else None

@@ -726,6 +726,16 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                         world_size=gp_utils.get_gp_world_size(),
                         node_partition=node_partition,
                     )
+                    if gp_ctx.edge_perm is not None:
+                        # wigner and the radial embedding are derived from
+                        # these downstream, so they must follow the same
+                        # local-source-first ordering as edge_index_local.
+                        perm = gp_ctx.edge_perm
+                        graph_dict["edge_index"] = graph_dict["edge_index"][:, perm]
+                        graph_dict["edge_distance"] = graph_dict["edge_distance"][perm]
+                        graph_dict["edge_distance_vec"] = graph_dict[
+                            "edge_distance_vec"
+                        ][perm]
                     if gp_config.transport == "symm_mem":
                         # Build here, alongside the context it belongs to, so
                         # the per-layer exchange stays a single traceable op

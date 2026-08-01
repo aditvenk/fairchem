@@ -55,6 +55,10 @@ class GraphParallelConfig:
     # symm_mem writes directly into peer memory instead of going through
     # NCCL's all-to-all, which underutilises the link at these message sizes.
     transport: GPTransport = GPTransport.NCCL
+    # Overlap the halo exchange with local-source edge compute. Reorders edges
+    # so the split is a contiguous slice, which perturbs scatter accumulation
+    # order, so it is off by default.
+    overlap: bool = False
 
 
 _GP_CONFIG: GraphParallelConfig | None = None

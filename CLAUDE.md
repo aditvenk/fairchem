@@ -300,6 +300,21 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
   isolated exchange and ~15-19% end to end. See
   `common/parallelism/symm_halo.py`, enabled with
   `job.graph_parallel.transport=symm_mem`.
+- A custom op whose `register_fake` returns `new_dynamic_size()` is a
+  "Dynamic shape operator" to Dynamo and breaks the graph at every call. That
+  cost 12 ms/step on the overlap path (113 -> 101 ms at 10k/GP=4) before it was
+  found via tlparse: `symm_halo_start` appeared in the compiled artifact but
+  `symm_halo_wait` did not, because the break put them in different graphs.
+  Where the output length is bounded, return the fixed buffer capacity instead
+  and let the caller ignore the tail; a high-water capacity is effectively
+  static, so it neither breaks the graph nor recompiles per step.
+- Inductor's compute/comm overlap scheduler cannot see out-of-tree collectives.
+  `is_collective()` (`torch/_inductor/utils.py:3200`) matches only
+  `ir._CollectiveKernel`, i.e. `_c10d_functional` ops, plus a hardcoded
+  torchrec allowlist carrying its own TODO. A custom op lowers to
+  `FallbackKernel` and is invisible to it, and
+  `reorder_for_compute_comm_overlap` is off by default anyway. An extension
+  point there would be the upstream fix.
 - Comm-compute overlap by splitting `forward_chunk` was implemented and reverted
   on `origin/rgao_a2a_dev` (`dba967bc6`), 12-17% slower on H200. That cost is a
   **torch.compile graph-break artifact, not intrinsic**: replaying the real fused
@@ -312,6 +327,17 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
 - Peer puts genuinely overlap with SM compute: a 26 MB symmetric-memory transfer
   issued on side streams alongside a 16 ms GEMM block costs no extra wall time.
   Overlap is blocked by the compiler boundary, not by the hardware.
+- Overlap is implemented behind `job.graph_parallel.overlap` and defaults off:
+  it is mechanically correct and does hide the transfer completely (eager wait
+  drops 6.7 -> 0.6 ms/step), but loses at every P=4 operating point measured --
+  spatial eager 324 -> 363 ms, spatial compiled 94.5 -> 101.5 ms, and
+  index_split (1.58x more comm) 352 -> 385 ms. The economics: the gain ceiling
+  is total comm time, while the floor cost is a second forward_chunk whose
+  fixed, node-sized cost is ~680 us per call, so ~5.4 ms/step over 4 layers and
+  both directions, plus ~1.3 ms for the edge reorder. At P=4 comm is only ~2
+  ms/step, so it cannot win. Crossover needs comm above roughly 7 ms/step AND a
+  high local-edge fraction; index_split supplies the first but not the second,
+  so it is not a valid proxy for high P.
 - Boundary-first (per-node) overlap cannot work at scale. The share of a rank's
   own atoms that some peer needs is 21% at P=4 but 82% at P=64 and 93% at P=128
   (N=100k, rho=0.085), so the interior left to hide comm behind vanishes exactly

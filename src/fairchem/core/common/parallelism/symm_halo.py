@@ -167,7 +167,9 @@ class _BufferPool:
 _POOL = _BufferPool()
 
 
-def _exchange(src, offsets, write_counts, read_counts, capacity, group):
+def _exchange(
+    src, offsets, write_counts, read_counts, capacity, group, defer_wait=False
+):
     """
     Bulk-copy each per-peer slice of ``src`` into that peer's buffer.
 
@@ -186,7 +188,8 @@ def _exchange(src, offsets, write_counts, read_counts, capacity, group):
         group: GP process group.
 
     Returns:
-        This rank's buffer, holding every peer's contribution.
+        (buffer, pending). With defer_wait the buffer is not yet complete and
+        pending must be passed to _finish_exchange; otherwise pending is None.
     """
     feat, dtype, device = tuple(src.shape[1:]), src.dtype, src.device
     buf, hdl, channel = _POOL.get(capacity, feat, dtype, device, group)
@@ -220,6 +223,20 @@ def _exchange(src, offsets, write_counts, read_counts, capacity, group):
                 # Same stream as the copy, so the signal cannot outrun the data.
                 hdl.put_signal(p, channel=channel)
 
+    if defer_wait:
+        # Caller runs independent compute before calling _finish_exchange.
+        return buf, (hdl, channel, use_signals, read_counts)
+    _finish_exchange((hdl, channel, use_signals, read_counts))
+    return buf, None
+
+
+def _finish_exchange(pending):
+    """
+    Block until every peer's contribution has landed in the local buffer.
+    """
+    hdl, channel, use_signals, read_counts = pending
+    cur = torch.cuda.current_stream()
+    streams = _get_streams()
     if use_signals:
         # Waiting on the current stream is safe: the side streams already
         # captured their dependency on it, so this rank's own puts still drain.
@@ -233,7 +250,6 @@ def _exchange(src, offsets, write_counts, read_counts, capacity, group):
             cur.wait_stream(s)
         # Double buffering already removed the matching pre-barrier.
         hdl.barrier(channel=channel)
-    return buf
 
 
 # Custom ops may only take tensors and primitives, so the plan is reached by
@@ -271,7 +287,7 @@ def symm_halo_collect(
         x_send = x_local[send_indices].contiguous()
     else:
         x_send = x_local.new_empty(0, *x_local.shape[1:])
-    buf = _exchange(
+    buf, _ = _exchange(
         x_send,
         plan.fwd_write_offsets,
         plan.send_counts,
@@ -306,7 +322,7 @@ def symm_halo_collect_backward(
 
     plan = _PLAN_SLOTS[int(plan_id)]
     # Roles reverse: gradient flows back to whoever sent the embeddings.
-    buf = _exchange(
+    buf, _ = _exchange(
         grad_recv.contiguous(),
         plan.bwd_write_offsets,
         plan.recv_counts,
@@ -325,6 +341,101 @@ def symm_halo_collect_backward(
 @symm_halo_collect_backward.register_fake
 def _(grad_recv, send_indices, plan_id, local_size):
     return grad_recv.new_empty(local_size, *grad_recv.shape[1:])
+
+
+# A layer has at most one exchange in flight, so a single slot is enough to
+# carry the un-awaited handle from start to wait.
+_PENDING: dict[int, object] = {}
+
+
+@torch.library.custom_op("fairchem::symm_halo_start", mutates_args=())
+def symm_halo_start(
+    x_local: torch.Tensor, send_indices: torch.Tensor, plan_id: int
+) -> torch.Tensor:
+    """
+    Issue the halo puts and return without waiting.
+
+    The puts go on side streams, so compute launched between this and
+    :func:`symm_halo_wait` runs while the transfer is in flight. The returned
+    token exists only to order the two ops.
+    """
+    from fairchem.core.common import gp_utils
+
+    plan = _PLAN_SLOTS[int(plan_id)]
+    if send_indices.numel() > 0:
+        x_send = x_local[send_indices].contiguous()
+    else:
+        x_send = x_local.new_empty(0, *x_local.shape[1:])
+    buf, pending = _exchange(
+        x_send,
+        plan.fwd_write_offsets,
+        plan.send_counts,
+        plan.recv_counts,
+        plan.fwd_capacity,
+        gp_utils.get_gp_group(),
+        defer_wait=True,
+    )
+    _PENDING[int(plan_id)] = (buf, pending)
+    return x_local.new_empty(0)
+
+
+@symm_halo_start.register_fake
+def _(x_local, send_indices, plan_id):
+    return x_local.new_empty(0)
+
+
+@torch.library.custom_op("fairchem::symm_halo_wait", mutates_args=())
+def symm_halo_wait(
+    token: torch.Tensor, x_local: torch.Tensor, send_indices: torch.Tensor, plan_id: int
+) -> torch.Tensor:
+    """
+    Block until the halo has landed and return it.
+
+    ``x_local`` is unused here -- the data was read at start -- and is taken
+    only so autograd has an edge to route the gradient back along.
+    """
+    buf, pending = _PENDING.pop(int(plan_id))
+    _finish_exchange(pending)
+    # Return the whole buffer, not buf[:total_recv]. A data-dependent length
+    # here is a dynamic-shape operator, and Dynamo breaks the graph at every
+    # wait -- which is precisely the fusion loss that overlap is trying to buy
+    # its way out of. Capacity is a high-water mark that changes rarely, so the
+    # shape is effectively static. Rows past total_recv are never indexed:
+    # remote entries of edge_index_local are all below
+    # total_local_atoms + total_recv.
+    # The pool may hold more than the plan asked for, so slice to the plan's
+    # capacity, which is what register_fake reports.
+    return buf[: _PLAN_SLOTS[int(plan_id)].fwd_capacity].clone()
+
+
+@symm_halo_wait.register_fake
+def _(token, x_local, send_indices, plan_id):
+    capacity = _PLAN_SLOTS[int(plan_id)].fwd_capacity
+    return x_local.new_empty(capacity, *x_local.shape[1:])
+
+
+def _wait_setup_context(ctx, inputs, output):
+    _token, x_local, send_indices, plan_id = inputs
+    ctx.send_indices = send_indices
+    ctx.plan_id = plan_id
+    ctx.local_size = x_local.shape[0]
+
+
+def _wait_backward(ctx, grad_recv):
+    grad_local = torch.ops.fairchem.symm_halo_collect_backward(
+        grad_recv, ctx.send_indices, ctx.plan_id, ctx.local_size
+    )
+    return None, grad_local, None, None
+
+
+torch.library.register_autograd(
+    "fairchem::symm_halo_wait", _wait_backward, setup_context=_wait_setup_context
+)
+# The token carries no value, so start contributes nothing to the gradient;
+# the whole exchange differentiates through wait.
+torch.library.register_autograd(
+    "fairchem::symm_halo_start", lambda ctx, g: (None, None, None)
+)
 
 
 def _collect_setup_context(ctx, inputs, output):
