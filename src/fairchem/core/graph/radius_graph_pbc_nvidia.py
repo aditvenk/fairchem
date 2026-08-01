@@ -196,10 +196,11 @@ def get_neighbors_nvidia(
             enforce_max_strictly=enforce_max_neighbors_strictly,
         )
 
-        c_index = c_index[mask_num_neighbors]
-        n_index = n_index[mask_num_neighbors]
-        distances_sq = distances_sq[mask_num_neighbors]
-        offsets = offsets[mask_num_neighbors]
+        if mask_num_neighbors is not None:
+            c_index = c_index[mask_num_neighbors]
+            n_index = n_index[mask_num_neighbors]
+            distances_sq = distances_sq[mask_num_neighbors]
+            offsets = offsets[mask_num_neighbors]
 
     return c_index, n_index, offsets, distances_sq
 

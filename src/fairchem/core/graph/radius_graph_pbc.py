@@ -7,8 +7,11 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import collections
+import dataclasses
 import logging
 import math
+import os
 
 import numpy as np
 import torch
@@ -22,10 +25,11 @@ def is_mixed_pbc(data) -> bool:
     across any of the 3 dimensions, which is not supported by radius_graph_pbc.
     """
     if hasattr(data, "pbc") and torch.atleast_2d(data.pbc).shape[0] > 1:
-        sys_pbc = torch.atleast_2d(data.pbc)
+        # Read the flags once; testing them on device costs a sync per column.
+        sys_pbc = torch.atleast_2d(data.pbc).tolist()
         for i in range(3):
-            col = sys_pbc[:, i]
-            if torch.any(col).item() and not torch.all(col).item():
+            col = [row[i] for row in sys_pbc]
+            if any(col) and not all(col):
                 return True
     return False
 
@@ -111,15 +115,14 @@ def get_max_neighbors_mask(
     image_indptr[1:] = torch.cumsum(natoms, dim=0)
     num_neighbors_image = sum_partitions(num_neighbors_thresholded, image_indptr)
 
-    # If max_num_neighbors is below the threshold, return early
+    # If max_num_neighbors is below the threshold, return early. None rather
+    # than an all-True mask, so callers can skip the trim with a Python test
+    # instead of a torch.all() that would sync.
     if (
         max_num_neighbors <= max_num_neighbors_threshold
         or max_num_neighbors_threshold <= 0
     ):
-        mask_num_neighbors = torch.tensor([True], dtype=bool, device=device).expand_as(
-            index
-        )
-        return mask_num_neighbors, num_neighbors_image
+        return None, num_neighbors_image
 
     # Create a tensor of size [num_atoms, max_num_neighbors] to sort the distances of the neighbors.
     # Fill with infinity so we can easily remove unused distances later.
@@ -338,7 +341,7 @@ def radius_graph_pbc(
         enforce_max_strictly=enforce_max_neighbors_strictly,
     )
 
-    if not torch.all(mask_num_neighbors):
+    if mask_num_neighbors is not None:
         # Mask out the atoms to ensure each atom has at most max_num_neighbors_threshold neighbors
         index1 = torch.masked_select(index1, mask_num_neighbors)
         index2 = torch.masked_select(index2, mask_num_neighbors)
@@ -409,6 +412,60 @@ def box_size_warning(cell, pos, pbc):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _PbcScaffold:
+    """
+    The parts of radius_graph_pbc_v2 that do not depend on atom positions.
+
+    Everything here is a function of (cell, pbc, natoms, radius) only: the
+    periodic image tiling, the source-atom expansion and the per-image
+    scatter map. A fixed-cell, fixed-composition simulation recomputes the
+    identical tensors on every step, which is ~46% of the function's CPU time
+    and ~142 of its ~314 tensor ops at 1000 atoms.
+    """
+
+    source_atom_index: torch.Tensor
+    source_atom_image: torch.Tensor
+    source_cell: torch.Tensor
+    source_pbc_cell_offsets: torch.Tensor
+    source_atom_mapping: torch.Tensor
+    max_num_source_atoms: torch.Tensor
+
+
+# Bounded so alternating between a few systems still hits, without pinning an
+# unbounded amount of device memory. Each entry is O(num_atoms * images).
+_SCAFFOLD_CACHE: collections.OrderedDict[tuple, _PbcScaffold] = (
+    collections.OrderedDict()
+)
+_SCAFFOLD_CACHE_MAX = 4
+_SCAFFOLD_CACHE_ENABLED = os.environ.get("FAIRCHEM_PBC_SCAFFOLD_CACHE", "1") == "1"
+
+
+def _scaffold_cache_key(data, radius, batch_size: int) -> tuple | None:
+    """
+    Build a host-side key from the cell, pbc and natoms.
+
+    Returns None when the inputs are not safe to key on, in which case the
+    caller rebuilds the scaffold. Reading these back costs a few small syncs;
+    they are tiny next to the work being skipped.
+
+    Assumes data.batch, when present, is the usual repeat_interleave of natoms
+    so that natoms identifies it.
+    """
+    try:
+        return (
+            tuple(data.cell.detach().reshape(-1).tolist()),
+            tuple(torch.atleast_2d(data.pbc).detach().reshape(-1).tolist()),
+            tuple(data.natoms.detach().reshape(-1).tolist()),
+            float(radius),
+            str(data.pos.device),
+            batch_size,
+            bool(hasattr(data, "node_partition")),
+        )
+    except (AttributeError, RuntimeError):
+        return None
+
+
 @torch.no_grad()
 def radius_graph_pbc_v2(
     data,
@@ -429,6 +486,15 @@ def radius_graph_pbc_v2(
     # Resolution of the grid cells, should be less than the radius
     grid_resolution = radius / 1.99
 
+    cache_key = (
+        _scaffold_cache_key(data, radius, batch_size)
+        if _SCAFFOLD_CACHE_ENABLED
+        else None
+    )
+    cached = _SCAFFOLD_CACHE.get(cache_key) if cache_key is not None else None
+    if cached is not None:
+        _SCAFFOLD_CACHE.move_to_end(cache_key)
+
     # This function assumes that all atoms are within the unti cell. If atoms
     # are outside of the unit cell, it will not work correctly.
     # position of the atoms
@@ -436,74 +502,7 @@ def radius_graph_pbc_v2(
     num_atoms = len(data.pos)
     num_atoms_per_image = data.natoms
 
-    # Calculate required number of unit cells in each direction.
-    # Smallest distance between planes separated by a1 is
-    # 1 / ||(a2 x a3) / V||_2, since a2 x a3 is the area of the plane.
-    # Note that the unit cell volume V = a1 * (a2 x a3) and that
-    # (a2 x a3) / V is also the reciprocal primitive vector
-    # (crystallographer's definition).
-
-    cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
-    cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
-
-    # Use per-system PBC from data.pbc so mixed-PBC batches are handled correctly.
-    # Each system's rep (number of periodic image repetitions) is computed from
-    # its own cell and masked to zero for non-periodic dimensions.
-    sys_pbc = torch.atleast_2d(data.pbc)  # (batch_size, 3)
-
-    inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
-    rep_a1 = torch.where(
-        sys_pbc[:, 0],
-        torch.ceil(radius * inv_min_dist_a1),
-        data.cell.new_zeros(batch_size),
-    )
-
-    cross_a3a1 = torch.cross(data.cell[:, 2], data.cell[:, 0], dim=-1)
-    inv_min_dist_a2 = torch.norm(cross_a3a1 / cell_vol, p=2, dim=-1)
-    rep_a2 = torch.where(
-        sys_pbc[:, 1],
-        torch.ceil(radius * inv_min_dist_a2),
-        data.cell.new_zeros(batch_size),
-    )
-
-    cross_a1a2 = torch.cross(data.cell[:, 0], data.cell[:, 1], dim=-1)
-    inv_min_dist_a3 = torch.norm(cross_a1a2 / cell_vol, p=2, dim=-1)
-    rep_a3 = torch.where(
-        sys_pbc[:, 2],
-        torch.ceil(radius * inv_min_dist_a3),
-        data.cell.new_zeros(batch_size),
-    )
-
-    rep = torch.cat([rep_a1.view(-1, 1), rep_a2.view(-1, 1), rep_a3.view(-1, 1)], dim=1)
-    cells_per_image = (
-        (rep[:, 0] * 2 + 1.0) * (rep[:, 1] * 2 + 1.0) * (rep[:, 2] * 2 + 1.0)
-    ).long()
-
-    # Create a tensor of unit cells for each image
-    unit_cell = torch.zeros(
-        torch.sum(cells_per_image), 3, device=device, dtype=data.cell.dtype
-    )
-    offset = 0
-    for i in range(batch_size):
-        cells_x = torch.arange(
-            -rep[i][0], rep[i][0] + 1, device=device, dtype=data.cell.dtype
-        )
-        cells_y = torch.arange(
-            -rep[i][1], rep[i][1] + 1, device=device, dtype=data.cell.dtype
-        )
-        cells_z = torch.arange(
-            -rep[i][2], rep[i][2] + 1, device=device, dtype=data.cell.dtype
-        )
-        unit_cell[offset : cells_per_image[i] + offset] = torch.cartesian_prod(
-            cells_x, cells_y, cells_z
-        )
-        offset = offset + cells_per_image[i]
-
-    # Compute the x, y, z positional offsets for each cell in each image
-    cell_matrix = torch.transpose(data.cell, 1, 2)
-    cell_matrix = torch.repeat_interleave(cell_matrix, cells_per_image, dim=0)
-    pbc_cell_offsets = torch.bmm(cell_matrix, unit_cell.view(-1, 3, 1)).squeeze(-1)
-
+    # target_* depend on the positions, so they stay outside the cached block.
     # If node_partition exists, this means we want to generate only a partial graph
     # from a subset of target atoms to the entire set of source atoms
     if hasattr(data, "node_partition"):
@@ -514,35 +513,151 @@ def radius_graph_pbc_v2(
         target_atom_pos = atom_pos
         target_atom_image = data_batch_idxs
 
-    # Compute the position of the source atoms for the edges. There are
-    # more source atoms than target atoms, since the source atoms are
-    # tiled by the PBC cells.
-    num_cells_per_atom = torch.repeat_interleave(cells_per_image, num_atoms_per_image)
-    source_atom_index = torch.repeat_interleave(
-        torch.arange(num_atoms, device=device).long(), num_cells_per_atom
-    )
-    source_atom_image = data_batch_idxs[source_atom_index]
-    source_atom_pos = atom_pos[source_atom_index]
+    if cached is None:
+        # Calculate required number of unit cells in each direction.
+        # Smallest distance between planes separated by a1 is
+        # 1 / ||(a2 x a3) / V||_2, since a2 x a3 is the area of the plane.
+        # Note that the unit cell volume V = a1 * (a2 x a3) and that
+        # (a2 x a3) / V is also the reciprocal primitive vector
+        # (crystallographer's definition).
 
-    # For each atom the index of the PBC cell
-    pbc_cell_index = torch.tensor([], device=device).long()
-    offset = 0
-    for i in range(batch_size):
-        cell_indices = (
-            torch.arange(offset, offset + cells_per_image[i], device=device)
-            .repeat(num_atoms_per_image[i])
-            .long()
+        cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
+        cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
+
+        # Use per-system PBC from data.pbc so mixed-PBC batches are handled correctly.
+        # Each system's rep (number of periodic image repetitions) is computed from
+        # its own cell and masked to zero for non-periodic dimensions.
+        sys_pbc = torch.atleast_2d(data.pbc)  # (batch_size, 3)
+
+        inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
+        rep_a1 = torch.where(
+            sys_pbc[:, 0],
+            torch.ceil(radius * inv_min_dist_a1),
+            data.cell.new_zeros(batch_size),
         )
-        pbc_cell_index = torch.cat([pbc_cell_index, cell_indices], dim=0)
-        offset = offset + cells_per_image[i]
 
-    # Remember the source cell for later use
-    source_cell = unit_cell[pbc_cell_index]
+        cross_a3a1 = torch.cross(data.cell[:, 2], data.cell[:, 0], dim=-1)
+        inv_min_dist_a2 = torch.norm(cross_a3a1 / cell_vol, p=2, dim=-1)
+        rep_a2 = torch.where(
+            sys_pbc[:, 1],
+            torch.ceil(radius * inv_min_dist_a2),
+            data.cell.new_zeros(batch_size),
+        )
 
-    # Compute their PBC cell offsets
-    source_pbc_cell_offsets = pbc_cell_offsets[pbc_cell_index]
-    # Add on the PBC cell offsets
-    source_atom_pos = source_atom_pos + source_pbc_cell_offsets
+        cross_a1a2 = torch.cross(data.cell[:, 0], data.cell[:, 1], dim=-1)
+        inv_min_dist_a3 = torch.norm(cross_a1a2 / cell_vol, p=2, dim=-1)
+        rep_a3 = torch.where(
+            sys_pbc[:, 2],
+            torch.ceil(radius * inv_min_dist_a3),
+            data.cell.new_zeros(batch_size),
+        )
+
+        rep = torch.cat(
+            [rep_a1.view(-1, 1), rep_a2.view(-1, 1), rep_a3.view(-1, 1)], dim=1
+        )
+        cells_per_image = (
+            (rep[:, 0] * 2 + 1.0) * (rep[:, 1] * 2 + 1.0) * (rep[:, 2] * 2 + 1.0)
+        ).long()
+
+        # Create a tensor of unit cells for each image
+        unit_cell = torch.zeros(
+            torch.sum(cells_per_image), 3, device=device, dtype=data.cell.dtype
+        )
+        offset = 0
+        for i in range(batch_size):
+            cells_x = torch.arange(
+                -rep[i][0], rep[i][0] + 1, device=device, dtype=data.cell.dtype
+            )
+            cells_y = torch.arange(
+                -rep[i][1], rep[i][1] + 1, device=device, dtype=data.cell.dtype
+            )
+            cells_z = torch.arange(
+                -rep[i][2], rep[i][2] + 1, device=device, dtype=data.cell.dtype
+            )
+            unit_cell[offset : cells_per_image[i] + offset] = torch.cartesian_prod(
+                cells_x, cells_y, cells_z
+            )
+            offset = offset + cells_per_image[i]
+
+        # Compute the x, y, z positional offsets for each cell in each image
+        cell_matrix = torch.transpose(data.cell, 1, 2)
+        cell_matrix = torch.repeat_interleave(cell_matrix, cells_per_image, dim=0)
+        pbc_cell_offsets = torch.bmm(cell_matrix, unit_cell.view(-1, 3, 1)).squeeze(-1)
+
+        # Compute the position of the source atoms for the edges. There are
+        # more source atoms than target atoms, since the source atoms are
+        # tiled by the PBC cells.
+        num_cells_per_atom = torch.repeat_interleave(
+            cells_per_image, num_atoms_per_image
+        )
+        source_atom_index = torch.repeat_interleave(
+            torch.arange(num_atoms, device=device).long(), num_cells_per_atom
+        )
+        source_atom_image = data_batch_idxs[source_atom_index]
+
+        # For each atom the index of the PBC cell
+        pbc_cell_index = torch.tensor([], device=device).long()
+        offset = 0
+        for i in range(batch_size):
+            cell_indices = (
+                torch.arange(offset, offset + cells_per_image[i], device=device)
+                .repeat(num_atoms_per_image[i])
+                .long()
+            )
+            pbc_cell_index = torch.cat([pbc_cell_index, cell_indices], dim=0)
+            offset = offset + cells_per_image[i]
+
+        # Remember the source cell for later use
+        source_cell = unit_cell[pbc_cell_index]
+        source_pbc_cell_offsets = pbc_cell_offsets[pbc_cell_index]
+
+        # Per-image scatter map used below to take grid min/max per system.
+        # Depends only on source_atom_image, so it belongs in the scaffold.
+        unique_atom_image, num_source_atoms_per_image = torch.unique(
+            source_atom_image, return_counts=True
+        )
+        max_num_source_atoms = torch.max(num_source_atoms_per_image)
+        source_atom_offset_per_image = torch.cumsum(
+            num_source_atoms_per_image, dim=0
+        ).roll(1)
+        source_atom_offset_per_image[0] = 0
+        source_atom_offset_per_image = torch.repeat_interleave(
+            source_atom_offset_per_image, num_source_atoms_per_image, 0
+        )
+        source_atom_mapping = (
+            torch.arange(
+                len(source_atom_offset_per_image), device=device, dtype=torch.long
+            )
+            - source_atom_offset_per_image
+        )
+        source_atom_mapping = (
+            source_atom_mapping
+            + torch.repeat_interleave(unique_atom_image, num_source_atoms_per_image, 0)
+            * max_num_source_atoms
+        )
+
+        cached = _PbcScaffold(
+            source_atom_index=source_atom_index,
+            source_atom_image=source_atom_image,
+            source_cell=source_cell,
+            source_pbc_cell_offsets=source_pbc_cell_offsets,
+            source_atom_mapping=source_atom_mapping,
+            max_num_source_atoms=max_num_source_atoms,
+        )
+        if cache_key is not None:
+            _SCAFFOLD_CACHE[cache_key] = cached
+            while len(_SCAFFOLD_CACHE) > _SCAFFOLD_CACHE_MAX:
+                _SCAFFOLD_CACHE.popitem(last=False)
+
+    source_atom_index = cached.source_atom_index
+    source_atom_image = cached.source_atom_image
+    source_cell = cached.source_cell
+    source_atom_mapping = cached.source_atom_mapping
+    max_num_source_atoms = cached.max_num_source_atoms
+
+    # Positions of the tiled source atoms: the only position-dependent part of
+    # the expansion.
+    source_atom_pos = atom_pos[source_atom_index] + cached.source_pbc_cell_offsets
 
     # Given the positions of all the atoms has been computed, we
     # split them up using a cubic grid to make pairwise comparisons
@@ -562,32 +677,8 @@ def radius_graph_pbc_v2(
     source_atom_grid = torch.floor(source_atom_pos / grid_resolution).long()
     target_atom_grid = torch.floor(target_atom_pos / grid_resolution).long()
 
-    # Find the min and max grid index for each image
-    unique_atom_image, num_source_atoms_per_image = torch.unique(
-        source_atom_image, return_counts=True
-    )
-    max_num_source_atoms = torch.max(num_source_atoms_per_image)
-    # Create a new array with size [batch_size, max_num_source_atoms] to hold
-    # the grid indices for each atom. We can then perform max/min on each
-    # image separately.
-    # First, create a mapping from the array of source atoms to the 2D array.
-    source_atom_offset_per_image = torch.cumsum(num_source_atoms_per_image, dim=0).roll(
-        1
-    )
-    source_atom_offset_per_image[0] = 0
-    source_atom_offset_per_image = torch.repeat_interleave(
-        source_atom_offset_per_image, num_source_atoms_per_image, 0
-    )
-    source_atom_mapping = (
-        torch.arange(len(source_atom_offset_per_image), device=device, dtype=torch.long)
-        - source_atom_offset_per_image
-    )
-    source_atom_mapping = (
-        source_atom_mapping
-        + torch.repeat_interleave(unique_atom_image, num_source_atoms_per_image, 0)
-        * max_num_source_atoms
-    )
-
+    # Find the min and max grid index for each image. source_atom_mapping and
+    # max_num_source_atoms come from the scaffold above.
     # Create 2D array
     source_atom_grid_per_image = torch.zeros(
         batch_size * max_num_source_atoms, 3, device=device, dtype=torch.long
@@ -740,10 +831,13 @@ def radius_graph_pbc_v2(
     )
     source_atom_edge_index = grid_atom_index[neighboring_grid_cells]
 
-    # Remove padded atoms
+    # Remove padded atoms. Each masked_select would sync separately to learn its
+    # own output size, so resolve the mask once and gather with the result: the
+    # gathers inherit their shape from keep and add no further syncs.
     atom_pad_mask = source_atom_edge_index.ne(-1)
-    source_atom_edge_index = torch.masked_select(source_atom_edge_index, atom_pad_mask)
-    target_atom_edge_index = torch.masked_select(target_atom_edge_index, atom_pad_mask)
+    keep = atom_pad_mask.reshape(-1).nonzero().squeeze(1)
+    source_atom_edge_index = source_atom_edge_index.reshape(-1)[keep]
+    target_atom_edge_index = target_atom_edge_index.reshape(-1)[keep]
 
     # Get the atom positions
     source_atom_edge_pos = source_atom_pos[source_atom_edge_index]
@@ -757,13 +851,10 @@ def radius_graph_pbc_v2(
     within_radius_mask = torch.logical_and(
         atom_distance_sqr.le(radius * radius), atom_distance_sqr.ne(0.0)
     )
-    source_atom_edge_index = torch.masked_select(
-        source_atom_edge_index, within_radius_mask
-    )
-    target_atom_edge_index = torch.masked_select(
-        target_atom_edge_index, within_radius_mask
-    )
-    atom_distance_sqr = torch.masked_select(atom_distance_sqr, within_radius_mask)
+    keep = within_radius_mask.nonzero().squeeze(1)
+    source_atom_edge_index = source_atom_edge_index[keep]
+    target_atom_edge_index = target_atom_edge_index[keep]
+    atom_distance_sqr = atom_distance_sqr[keep]
 
     # Get the return values
     # The indices of the atoms for each edge
@@ -771,11 +862,6 @@ def radius_graph_pbc_v2(
     target_idx = target_atom_edge_index
     # The cell for each source atom
     source_cell = source_cell[source_atom_edge_index]
-    # The number of edge per image
-    no_op, num_neighbors_image = torch.unique(
-        source_atom_image[source_atom_edge_index], return_counts=True
-    )
-
     # Reduce the number of neighbors for each atom to the
     # desired threshold max_num_neighbors_threshold
 
@@ -795,7 +881,7 @@ def radius_graph_pbc_v2(
         enforce_max_strictly=enforce_max_neighbors_strictly,
     )
 
-    if not torch.all(mask_num_neighbors):
+    if mask_num_neighbors is not None:
         # Mask out the atoms to ensure each atom has at most max_num_neighbors_threshold neighbors
         target_idx = torch.masked_select(target_idx, mask_num_neighbors)
         source_idx = torch.masked_select(source_idx, mask_num_neighbors)

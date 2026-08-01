@@ -7,13 +7,21 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from fairchem.core.graph.radius_graph_pbc import (
     radius_graph_pbc,
     radius_graph_pbc_v2,
 )
-from fairchem.core.graph.radius_graph_pbc_nvidia import radius_graph_pbc_nvidia
+from fairchem.core.graph.radius_graph_pbc_nvidia import (
+    nvalchemiops_installed,
+    radius_graph_pbc_nvidia,
+)
+
+# Warn once per process, not once per inference step.
+_NVIDIA_FALLBACK_WARNED: list[bool] = []
 
 
 def filter_edges_by_node_partition(
@@ -148,6 +156,19 @@ def generate_graph(
             - 'offset_distances' (torch.Tensor): Distances between the atoms connected by the edges, including the cell offsets.
             - 'neighbors' (torch.Tensor): Number of neighbors for each atom.
     """
+    if radius_pbc_version == 3 and not nvalchemiops_installed():
+        # nvalchemiops is an optional dependency, so callers that ask for
+        # version 3 (including the turbo preset) still have to run somewhere it
+        # is missing. Version 2 produces the same graph, just more slowly.
+        if not _NVIDIA_FALLBACK_WARNED:
+            logging.warning(
+                "radius_pbc_version=3 requires nvalchemiops, which is not "
+                "installed; falling back to version 2. Install with "
+                "`pip install nvalchemi-toolkit-ops` for faster graph generation."
+            )
+            _NVIDIA_FALLBACK_WARNED.append(True)
+        radius_pbc_version = 2
+
     if radius_pbc_version == 1:
         radius_graph_pbc_fn = radius_graph_pbc
     elif radius_pbc_version == 2:
