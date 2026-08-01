@@ -27,6 +27,7 @@ from fairchem.core.common.parallelism.graph_parallel_a2a import (
 from fairchem.core.common.parallelism.graph_partition import (
     PartitionStrategy,
 )
+from fairchem.core.common.parallelism.symm_halo import prepare_symm_plan
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import generate_graph
@@ -725,6 +726,11 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                         world_size=gp_utils.get_gp_world_size(),
                         node_partition=node_partition,
                     )
+                    if gp_config.transport == "symm_mem":
+                        # Build here, alongside the context it belongs to, so
+                        # the per-layer exchange stays a single traceable op
+                        # instead of breaking the graph to build a plan.
+                        prepare_symm_plan(gp_ctx)
                 data_dict["gp_ctx"] = gp_ctx
                 data_dict["scatter_target"] = gp_ctx.edge_index_local[1]
             else:

@@ -236,25 +236,22 @@ def _exchange(src, offsets, write_counts, read_counts, capacity, group):
     return buf
 
 
-# Custom ops may only take tensors and primitives, so plans are handed across
-# the op boundary by integer id -- the same device functional collectives use to
-# pass a process group as ``group_name``. A few slots are retained because a
-# step's backward runs against the plan its forward registered.
-_PLAN_REGISTRY: dict[int, SymmHaloPlan] = {}
-_PLAN_SEQ = 0
-_PLAN_KEEP = 8
+# Custom ops may only take tensors and primitives, so the plan is reached by
+# integer id -- the same device functional collectives use to pass a process
+# group as ``group_name``. The id is a fixed slot rather than a running counter:
+# Dynamo specialises on it, so a changing id would recompile every MD step.
+# One slot suffices because predict() is synchronous, so a step's backward
+# always runs against the plan its own forward registered.
+_PLAN_SLOTS: dict[int, SymmHaloPlan] = {}
+_DEFAULT_SLOT = 0
 
 
-def register_plan(plan: SymmHaloPlan) -> int:
+def register_plan(plan: SymmHaloPlan, slot: int = _DEFAULT_SLOT) -> int:
     """
-    Publish a plan for the traceable ops and return its id.
+    Publish a plan into a fixed slot and return that slot's id.
     """
-    global _PLAN_SEQ
-    _PLAN_SEQ += 1
-    _PLAN_REGISTRY[_PLAN_SEQ] = plan
-    for stale in [k for k in _PLAN_REGISTRY if k <= _PLAN_SEQ - _PLAN_KEEP]:
-        del _PLAN_REGISTRY[stale]
-    return _PLAN_SEQ
+    _PLAN_SLOTS[slot] = plan
+    return slot
 
 
 @torch.library.custom_op("fairchem::symm_halo_collect", mutates_args=())
@@ -269,7 +266,7 @@ def symm_halo_collect(
     """
     from fairchem.core.common import gp_utils
 
-    plan = _PLAN_REGISTRY[plan_id]
+    plan = _PLAN_SLOTS[int(plan_id)]
     if send_indices.numel() > 0:
         x_send = x_local[send_indices].contiguous()
     else:
@@ -289,7 +286,10 @@ def symm_halo_collect(
 
 @symm_halo_collect.register_fake
 def _(x_local, send_indices, plan_id):
-    return x_local.new_empty(_PLAN_REGISTRY[plan_id].total_recv, *x_local.shape[1:])
+    # The halo size shifts as atoms move, so report it as unbacked rather than
+    # baking in this step's value and guarding a recompile on it.
+    n_recv = torch.library.get_ctx().new_dynamic_size()
+    return x_local.new_empty(n_recv, *x_local.shape[1:])
 
 
 @torch.library.custom_op("fairchem::symm_halo_collect_backward", mutates_args=())
@@ -304,7 +304,7 @@ def symm_halo_collect_backward(
     """
     from fairchem.core.common import gp_utils
 
-    plan = _PLAN_REGISTRY[plan_id]
+    plan = _PLAN_SLOTS[int(plan_id)]
     # Roles reverse: gradient flows back to whoever sent the embeddings.
     buf = _exchange(
         grad_recv.contiguous(),
@@ -348,6 +348,23 @@ torch.library.register_autograd(
 )
 
 
+@torch.compiler.disable
+def prepare_symm_plan(gp_ctx: GPContext) -> None:
+    """
+    Build and publish this context's exchange plan.
+
+    Call once per GPContext, next to where the context itself is built. Doing
+    it lazily inside the layer loop would break the compiled graph on every
+    layer, which is the thing the custom op exists to avoid.
+    """
+    from fairchem.core.common import gp_utils
+
+    with record_function("symm_build_plan"):
+        plan = build_symm_plan(gp_ctx.send_counts, gp_utils.get_gp_group())
+        plan.plan_id = register_plan(plan)
+    gp_ctx.symm_plan = plan
+
+
 def symm_all_to_all_collect(x_local: torch.Tensor, gp_ctx: GPContext):
     """
     Collect remote node embeddings via symmetric memory.
@@ -362,14 +379,8 @@ def symm_all_to_all_collect(x_local: torch.Tensor, gp_ctx: GPContext):
     Returns:
         Remote node embeddings, shape (total_recv, *features).
     """
-    from fairchem.core.common import gp_utils
-
-    plan = getattr(gp_ctx, "symm_plan", None)
-    if plan is None:
-        with record_function("symm_build_plan"):
-            plan = build_symm_plan(gp_ctx.send_counts, gp_utils.get_gp_group())
-            plan.plan_id = register_plan(plan)
-        gp_ctx.symm_plan = plan
+    if gp_ctx.symm_plan is None:
+        prepare_symm_plan(gp_ctx)
     return torch.ops.fairchem.symm_halo_collect(
-        x_local, gp_ctx.send_indices, plan.plan_id
+        x_local, gp_ctx.send_indices, gp_ctx.symm_plan.plan_id
     )
