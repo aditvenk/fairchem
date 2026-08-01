@@ -19,14 +19,24 @@ from fairchem.core.common.parallelism.graph_partition import (
     partition_atoms_index_split,
     partition_atoms_spatial,
 )
+from fairchem.core.common.parallelism.symm_halo import (
+    SymmHaloPlan,
+    build_symm_plan,
+    symm_all_to_all_collect,
+    symm_halo_collect,
+)
 
 __all__ = [
     "AllToAllCollect",
     "GPContext",
     "PartitionStrategy",
+    "symm_halo_collect",
+    "SymmHaloPlan",
     "all_to_all_collect",
     "build_gp_context",
     "compute_a2a_partition",
     "partition_atoms_index_split",
     "partition_atoms_spatial",
+    "symm_all_to_all_collect",
+    "build_symm_plan",
 ]

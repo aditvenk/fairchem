@@ -41,11 +41,20 @@ class GPPartition(StrEnum):
     SPATIAL = "spatial"
 
 
+class GPTransport(StrEnum):
+    NCCL = "nccl"
+    SYMM_MEM = "symm_mem"
+
+
 @dataclass
 class GraphParallelConfig:
     group_size: int = 1
     mode: GPMode = GPMode.ALLGATHER
     partition: GPPartition = GPPartition.INDEX_SPLIT
+    # Wire transport for mode=all_to_all. Same exchange semantics either way;
+    # symm_mem writes directly into peer memory instead of going through
+    # NCCL's all-to-all, which underutilises the link at these message sizes.
+    transport: GPTransport = GPTransport.NCCL
 
 
 _GP_CONFIG: GraphParallelConfig | None = None

@@ -20,6 +20,7 @@ from fairchem.core.common.parallelism.graph_parallel_a2a import (
     GPContext,
     all_to_all_collect,
 )
+from fairchem.core.common.parallelism.symm_halo import symm_all_to_all_collect
 from fairchem.core.models.uma.nn.activation import (
     GateActivation,
     SeparableS2Activation_M,
@@ -139,9 +140,15 @@ class Edgewise(torch.nn.Module):
                 If None, defaults to ``edge_index[1]`` (no GP).
         """
         if gp_utils.initialized():
-            if gp_utils.get_gp_config().mode == "all_to_all":
+            gp_config = gp_utils.get_gp_config()
+            if gp_config.mode == "all_to_all":
+                collect = (
+                    symm_all_to_all_collect
+                    if gp_config.transport == "symm_mem"
+                    else all_to_all_collect
+                )
                 with record_function("a2a_collect"):
-                    x_received = all_to_all_collect(x, gp_ctx)
+                    x_received = collect(x, gp_ctx)
                     x_full = torch.cat([x, x_received], dim=0)
                     edge_index_local = gp_ctx.edge_index_local
             else:

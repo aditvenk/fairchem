@@ -82,6 +82,7 @@ class GPContext:
         total_recv: Total number of embeddings to receive (sum of recv_splits).
         local_edge_idx: Indices into edge_index_local where source is a local atom.
         remote_edge_idx: Indices into edge_index_local where source is a remote atom.
+        symm_plan: Cached SymmHaloPlan, set on first symmetric-memory exchange.
         rank_assignments: Rank owner for each atom, shape (total_atoms,).
     """
 
@@ -98,6 +99,9 @@ class GPContext:
     local_edge_idx: torch.Tensor
     remote_edge_idx: torch.Tensor
     rank_assignments: torch.Tensor
+    # Populated lazily by symm_all_to_all_collect; depends only on the
+    # partition, so it is reused by every layer sharing this context.
+    symm_plan: object | None = None
 
 
 def _sparse_index_exchange(

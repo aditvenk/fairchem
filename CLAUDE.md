@@ -283,6 +283,85 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
   GPU matrix is expensive. Reproduce failures with the exact test node (and
   repeat it when appropriate) before rerunning a full GPU shard.
 
+## Graph-Parallel Comm Gotchas
+
+- UMA is numerically nondeterministic run to run: edge messages scatter with
+  `index_add_`/`scatter_add` atomics. At 30k atoms this is ~1.5e-1 eV total
+  energy and ~8e-4 eV/A max force. Never judge a change by a single A-vs-B
+  comparison; sample both paths several times and compare the cross-spread
+  against each path's own self-spread. A single pair will show a ~4x "deviation"
+  that is pure noise. Note the 8e-4 eV/A floor already exceeds the A2A PR's
+  1e-4 eV/A tolerance, so that tolerance cannot be applied to max-abs force
+  error on large systems.
+- NCCL `all_to_all_single` badly underutilizes the link at UMA's halo sizes
+  (few MB split across many peers). Measured on 4x H100 over PCIe/PHB: 3.6 GB/s
+  versus 53.4 GB/s raw `cudaMemcpyPeer`. Direct peer writes through
+  `torch.distributed._symmetric_memory` reach ~50% of peak, 14.8x faster on the
+  isolated exchange and ~15-19% end to end. See
+  `common/parallelism/symm_halo.py`, enabled with
+  `job.graph_parallel.transport=symm_mem`.
+- Comm-compute overlap by splitting `forward_chunk` was implemented and reverted
+  on `origin/rgao_a2a_dev` (`dba967bc6`), 12-17% slower on H200. That cost is a
+  **torch.compile graph-break artifact, not intrinsic**: replaying the real fused
+  edgewise over 432k edges as two calls costs only 0.6-1.8% with compile off, and
+  is flat across split ratios from 50/50 to 90/10. The GP forward already forces
+  11 graph breaks / 12 graphs, almost all from `@torch.compiler.disable`d
+  collectives; hand-splitting adds more. Fix the tracing before re-attempting
+  overlap. The `local_edge_idx`/`remote_edge_idx` fields are leftovers from that
+  attempt, not an unfinished intent.
+- Peer puts genuinely overlap with SM compute: a 26 MB symmetric-memory transfer
+  issued on side streams alongside a 16 ms GEMM block costs no extra wall time.
+  Overlap is blocked by the compiler boundary, not by the hardware.
+- Boundary-first (per-node) overlap cannot work at scale. The share of a rank's
+  own atoms that some peer needs is 21% at P=4 but 82% at P=64 and 93% at P=128
+  (N=100k, rho=0.085), so the interior left to hide comm behind vanishes exactly
+  where comm matters. An edge split (local-source vs remote-source, 74-81% local
+  at P=64) does retain cover and is the only viable split.
+- Morton partitioning gives a rank only ~18-21 active peers regardless of P
+  (geometric neighbour count saturates): 28% of ranks at P=64, 17% at P=128. Both
+  NCCL all-to-all and `SymmetricMemory.barrier()` synchronize with all P, so sync
+  is O(P) where it could be O(active peers).
+- Per-peer `put_signal`/`wait_signal` is NOT unconditionally better: it costs one
+  kernel launch per peer against the barrier's one total. Measured at P=4, where
+  3 of 4 peers are active, signals cost 5.91 ms/step against the barrier's
+  2.61 ms. `_exchange` therefore picks signals only when neighbours are sparse
+  (`2 * n_readers < world_size`), which under Morton kicks in around P>=32. Do
+  not "simplify" this back to always-signals without measuring at high P.
+- Double buffering the symmetric allocation removes the pre-write barrier
+  outright: a peer racing to exchange k+1 writes the other buffer, and it cannot
+  reach k+2 without first consuming this rank's k+1 contribution. Two barriers
+  per exchange became one, 2.61 -> 2.24 ms/step at P=4.
+- A sync path that only triggers at high peer sparsity is easy to leave
+  untested. `test_symm_halo.py` runs both a dense and a ring count matrix so the
+  barrier and signal paths are each covered at world_size=3.
+- The `x_full = torch.cat([x, x_received])` halo concatenation is 0.21 ms/step
+  at 30k/GP=4, i.e. negligible. The large `CatArrayBatchedCopy` time in profiles
+  belongs to other cats (graph gen, wigner, edge embedding). Do not "optimize"
+  the halo cat without measuring it in isolation first.
+- Under spatial partitioning the halo exceeds the local partition at high rank
+  counts: at N=100k/P=64 it is 2326 halo nodes against 1562 owned. Comm volume
+  per rank decays only as P^-1/3 while owned nodes decay as P^-1.
+- Profiler `self_device_time_total` summed over all events double-counts,
+  because `record_function` regions are credited alongside their child kernels.
+  Total came out 2.8x wall time. Filter to leaf kernels or use wall clock.
+
+## Environment Gotchas
+
+- e3nn ships a `.pt` cache containing `slice`, which torch 2.14's default
+  `weights_only=True` rejects at import time. Run tests with
+  `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`, or call
+  `torch.serialization.add_safe_globals([slice])` before importing fairchem.
+- Several multi-process GPU tests fail on a 4-GPU dev box independently of any
+  change: `test_a2a_vs_allgather_gpu[4-edges0]`, `test_a2a_backward_gpu`,
+  `test_a2a_multi_rank_gpu[2,3]`, `test_a2a_spatial_partition_gpu`, and the
+  `test_*_wigner_*_gradcheck` cases. Always confirm a failure against a clean
+  tree (`git stash push -- src/ tests/`) before attributing it to your change.
+- `pre-commit run` cannot fetch hook repos from this environment (proxy blocks
+  github.com). Run `ruff check --config ruff.toml` and `ruff format --config
+  ruff.toml` directly instead.
+- Allgather GP mode OOMs at 30k atoms on 4x 95GB H100 without activation
+  checkpointing; A2A mode fits. A2A at GP=4 OOMs by 60k atoms.
+
 ## Hessian Backend Gotchas
 
 - PyTorch's generic `vmap` fallback cannot batch the mutable, output-argument
